@@ -30,77 +30,6 @@ struct block_q4_0
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
 
-// Q4_0 dequantization - EXACT pattern from cpy.cl
-// Q4_0 format: qs[i] stores value[i] (low nibble) and value[i+16] (high nibble)
-// Cooperative loading for K cache
-inline void dequant_q4_0_block_cooperative(
-    global const struct block_q4_0 * block,
-    __local half4 * out,
-    int tid,
-    int stride
-) {
-    const half d = block->d;
-    
-    // 32 elements = 16 qs bytes = 8 half4 vectors
-    // Process cooperatively across threads
-    for (int vec_idx = tid; vec_idx < 8; vec_idx += stride) {
-        // Which 4 elements are we processing?
-        const int elem_base = vec_idx * 4;
-        
-        if (elem_base < 16) {
-            // First 4 half4 vectors: elements 0-15 (low nibbles)
-            const int qs_base = elem_base;
-            out[vec_idx] = (half4)(
-                (half)(((int)(block->qs[qs_base + 0] & 0x0F) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 1] & 0x0F) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 2] & 0x0F) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 3] & 0x0F) - 8) * d)
-            );
-        } else {
-            // Last 4 half4 vectors: elements 16-31 (high nibbles)
-            const int qs_base = elem_base - 16;
-            out[vec_idx] = (half4)(
-                (half)(((int)(block->qs[qs_base + 0] >> 4) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 1] >> 4) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 2] >> 4) - 8) * d),
-                (half)(((int)(block->qs[qs_base + 3] >> 4) - 8) * d)
-            );
-        }
-    }
-}
-
-// Fast inline V dequantization - EXACT pattern from cpy.cl
-inline half4 dequant_q4_0_vec4(
-    global const struct block_q4_0 * blocks,
-    int elem_idx
-) {
-    const int block_idx = elem_idx / QK4_0;
-    const int offset_in_block = elem_idx % QK4_0;
-    
-    global const struct block_q4_0 * block = &blocks[block_idx];
-    const half d = block->d;
-    
-    // Each half4 has 4 consecutive elements
-    if (offset_in_block < 16) {
-        // Elements 0-15: low nibbles
-        return (half4)(
-            (half)(((int)(block->qs[offset_in_block + 0] & 0x0F) - 8) * d),
-            (half)(((int)(block->qs[offset_in_block + 1] & 0x0F) - 8) * d),
-            (half)(((int)(block->qs[offset_in_block + 2] & 0x0F) - 8) * d),
-            (half)(((int)(block->qs[offset_in_block + 3] & 0x0F) - 8) * d)
-        );
-    } else {
-        // Elements 16-31: high nibbles
-        const int qs_idx = offset_in_block - 16;
-        return (half4)(
-            (half)(((int)(block->qs[qs_idx + 0] >> 4) - 8) * d),
-            (half)(((int)(block->qs[qs_idx + 1] >> 4) - 8) * d),
-            (half)(((int)(block->qs[qs_idx + 2] >> 4) - 8) * d),
-            (half)(((int)(block->qs[qs_idx + 3] >> 4) - 8) * d)
-        );
-    }
-}
-
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
 ) {
@@ -216,9 +145,10 @@ __kernel void flash_attn_f32_q4_0(
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
     const int causal_limit = is_causal ? (n_kv - n_q + my_query_row) : n_kv;
 
-    // Only K in local memory (8KB) - better occupancy for Q4_0
-    // V is dequantized on-the-fly with optimized inline function
+    // K and V in local memory - critical for Q4_0 performance!
+    // Dequantize once per tile instead of per-iteration
     __local half4 l_k[BLOCK_N][DK_VEC];
+    __local half4 l_v[BLOCK_N][DV_VEC];
 
     // Precompute base offsets
     const ulong v_base_offset = (ulong)batch_idx * v_nb3 + (ulong)head_kv_idx * v_nb2;
@@ -233,21 +163,69 @@ __kernel void flash_attn_f32_q4_0(
         const int k_tile_end = min(k_start + BLOCK_N, n_kv);
         const int k_tile_size = k_tile_end - k_start;
         
-        // Load and dequantize K tile cooperatively
-        #pragma unroll 1
-        for (int row = 0; row < BLOCK_N; ++row) {
-            if (row < k_tile_size) {
-                const ulong k_row_offset = k_base_offset + (k_start + row) * k_nb1;
-                const global struct block_q4_0 * k_blocks = 
-                    (const global struct block_q4_0 *)(k_base + k_row_offset);
+        // Load and dequantize K and V tiles cooperatively
+        // Single cooperative load to maximize efficiency
+        for (int row = tid; row < k_tile_size * max(k_blocks_per_row, v_blocks_per_row) * 8; row += WG_SIZE) {
+            const int tile_row = row / (max(k_blocks_per_row, v_blocks_per_row) * 8);
+            const int remainder = row % (max(k_blocks_per_row, v_blocks_per_row) * 8);
+            const int block_idx = remainder / 8;
+            const int vec_idx = remainder % 8;
+            
+            if (tile_row < k_tile_size) {
+                // Dequantize K
+                if (block_idx < k_blocks_per_row) {
+                    const ulong k_row_offset = k_base_offset + (k_start + tile_row) * k_nb1;
+                    const global struct block_q4_0 * k_blocks = 
+                        (const global struct block_q4_0 *)(k_base + k_row_offset);
+                    const global struct block_q4_0 * kb = &k_blocks[block_idx];
+                    const half d = kb->d;
+                    const int out_idx = block_idx * 8 + vec_idx;
+                    
+                    const int elem_base = vec_idx * 4;
+                    if (elem_base < 16) {
+                        l_k[tile_row][out_idx] = (half4)(
+                            (half)(((int)(kb->qs[elem_base + 0] & 0x0F) - 8) * d),
+                            (half)(((int)(kb->qs[elem_base + 1] & 0x0F) - 8) * d),
+                            (half)(((int)(kb->qs[elem_base + 2] & 0x0F) - 8) * d),
+                            (half)(((int)(kb->qs[elem_base + 3] & 0x0F) - 8) * d)
+                        );
+                    } else {
+                        const int qs_base = elem_base - 16;
+                        l_k[tile_row][out_idx] = (half4)(
+                            (half)(((int)(kb->qs[qs_base + 0] >> 4) - 8) * d),
+                            (half)(((int)(kb->qs[qs_base + 1] >> 4) - 8) * d),
+                            (half)(((int)(kb->qs[qs_base + 2] >> 4) - 8) * d),
+                            (half)(((int)(kb->qs[qs_base + 3] >> 4) - 8) * d)
+                        );
+                    }
+                }
                 
-                for (int block_idx = 0; block_idx < k_blocks_per_row; ++block_idx) {
-                    dequant_q4_0_block_cooperative(
-                        &k_blocks[block_idx],
-                        &l_k[row][block_idx * (QK4_0/4)],
-                        tid,
-                        WG_SIZE
-                    );
+                // Dequantize V
+                if (block_idx < v_blocks_per_row) {
+                    const ulong v_row_offset = v_base_offset + (k_start + tile_row) * v_nb1;
+                    const global struct block_q4_0 * v_blocks = 
+                        (const global struct block_q4_0 *)(v_base + v_row_offset);
+                    const global struct block_q4_0 * vb = &v_blocks[block_idx];
+                    const half d = vb->d;
+                    const int out_idx = block_idx * 8 + vec_idx;
+                    
+                    const int elem_base = vec_idx * 4;
+                    if (elem_base < 16) {
+                        l_v[tile_row][out_idx] = (half4)(
+                            (half)(((int)(vb->qs[elem_base + 0] & 0x0F) - 8) * d),
+                            (half)(((int)(vb->qs[elem_base + 1] & 0x0F) - 8) * d),
+                            (half)(((int)(vb->qs[elem_base + 2] & 0x0F) - 8) * d),
+                            (half)(((int)(vb->qs[elem_base + 3] & 0x0F) - 8) * d)
+                        );
+                    } else {
+                        const int qs_base = elem_base - 16;
+                        l_v[tile_row][out_idx] = (half4)(
+                            (half)(((int)(vb->qs[qs_base + 0] >> 4) - 8) * d),
+                            (half)(((int)(vb->qs[qs_base + 1] >> 4) - 8) * d),
+                            (half)(((int)(vb->qs[qs_base + 2] >> 4) - 8) * d),
+                            (half)(((int)(vb->qs[qs_base + 3] >> 4) - 8) * d)
+                        );
+                    }
                 }
             }
         }
@@ -317,22 +295,15 @@ __kernel void flash_attn_f32_q4_0(
                     p_sum += p[w];
                 }
 
-                // V accumulation - on-the-fly dequantization with optimized inline function
+                // V accumulation - from local memory (same as FP16!)
                 #pragma unroll
                 for (int i = 0; i < DV_VEC; ++i) {
                     float4 v_acc = (float4)(0.0f);
                     
                     #pragma unroll
                     for (int w = 0; w < UNROLL_FACTOR; ++w) {
-                        const int k_row = k_start + j + w;
-                        if (k_row < n_kv && p[w] > 0.0f) {
-                            const ulong v_row_offset = v_base_offset + k_row * v_nb1;
-                            const global struct block_q4_0 * v_blocks = 
-                                (const global struct block_q4_0 *)(v_base + v_row_offset);
-                            
-                            // Fast inline dequantization
-                            const half4 v_val = dequant_q4_0_vec4(v_blocks, i * 4);
-                            v_acc = mad((float4)(p[w]), convert_float4(v_val), v_acc);
+                        if (j + w < k_tile_size && p[w] > 0.0f) {
+                            v_acc = mad((float4)(p[w]), convert_float4(l_v[j + w][i]), v_acc);
                         }
                     }
                     
