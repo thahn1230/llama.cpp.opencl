@@ -474,6 +474,7 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
@@ -1522,9 +1523,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 CL_CHECK(clReleaseProgram(prog_f32_f16));
 
                 cl_program prog_f32_q4_0 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q4_0.c_str(), OPTS);
-                cl_kernel k_f32_q4_0;
+                cl_kernel k_f32_q4_0, k_f32_q4_0_q1;
                 CL_CHECK((k_f32_q4_0 = clCreateKernel(prog_f32_q4_0, "flash_attn_f32_q4_0", &err), err));
+                CL_CHECK((k_f32_q4_0_q1 = clCreateKernel(prog_f32_q4_0, "flash_attn_f32_q4_0_q1", &err), err));
                 backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}] = k_f32_q4_0;
+                backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = k_f32_q4_0_q1;
                 CL_CHECK(clReleaseProgram(prog_f32_q4_0));
 
                 backend_ctx->kernels_flash_attn_bm[{dk, dv}] = bm;
@@ -6802,8 +6805,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     if (n_q == 1) {
         if (is_q4_0) {
-            // Q4_0 KV cache doesn't have decoding kernel yet, use prefill kernel
-            kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+            // Q4_0 decoding kernel: cache K+V for better performance
+            kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
         } else if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
@@ -6813,6 +6816,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     } else {
         if (is_q4_0) {
+            // Q4_0 prefill kernel: cache K only for better occupancy
             kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
         } else if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);

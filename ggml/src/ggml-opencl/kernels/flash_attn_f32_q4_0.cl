@@ -145,10 +145,8 @@ __kernel void flash_attn_f32_q4_0(
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
     const int causal_limit = is_causal ? (n_kv - n_q + my_query_row) : n_kv;
 
-    // K and V in local memory - critical for Q4_0 performance!
-    // Dequantize once per tile instead of per-iteration
+    // Prefill: K only in local memory (better occupancy with many queries)
     __local half4 l_k[BLOCK_N][DK_VEC];
-    __local half4 l_v[BLOCK_N][DV_VEC];
 
     // Precompute base offsets
     const ulong v_base_offset = (ulong)batch_idx * v_nb3 + (ulong)head_kv_idx * v_nb2;
@@ -163,71 +161,42 @@ __kernel void flash_attn_f32_q4_0(
         const int k_tile_end = min(k_start + BLOCK_N, n_kv);
         const int k_tile_size = k_tile_end - k_start;
         
-        // Load and dequantize K and V tiles cooperatively
-        // Single cooperative load to maximize efficiency
-        for (int row = tid; row < k_tile_size * max(k_blocks_per_row, v_blocks_per_row) * 8; row += WG_SIZE) {
-            const int tile_row = row / (max(k_blocks_per_row, v_blocks_per_row) * 8);
-            const int remainder = row % (max(k_blocks_per_row, v_blocks_per_row) * 8);
-            const int block_idx = remainder / 8;
-            const int vec_idx = remainder % 8;
+        // Load and dequantize K tile (coalesced access)
+        #pragma unroll 1
+        for (int idx = tid; idx < BLOCK_N * DK_VEC; idx += WG_SIZE) {
+            const int row = idx / DK_VEC;
+            const int col = idx % DK_VEC;
             
-            if (tile_row < k_tile_size) {
-                // Dequantize K
-                if (block_idx < k_blocks_per_row) {
-                    const ulong k_row_offset = k_base_offset + (k_start + tile_row) * k_nb1;
-                    const global struct block_q4_0 * k_blocks = 
-                        (const global struct block_q4_0 *)(k_base + k_row_offset);
-                    const global struct block_q4_0 * kb = &k_blocks[block_idx];
-                    const half d = kb->d;
-                    const int out_idx = block_idx * 8 + vec_idx;
-                    
-                    const int elem_base = vec_idx * 4;
-                    if (elem_base < 16) {
-                        l_k[tile_row][out_idx] = (half4)(
-                            (half)(((int)(kb->qs[elem_base + 0] & 0x0F) - 8) * d),
-                            (half)(((int)(kb->qs[elem_base + 1] & 0x0F) - 8) * d),
-                            (half)(((int)(kb->qs[elem_base + 2] & 0x0F) - 8) * d),
-                            (half)(((int)(kb->qs[elem_base + 3] & 0x0F) - 8) * d)
-                        );
-                    } else {
-                        const int qs_base = elem_base - 16;
-                        l_k[tile_row][out_idx] = (half4)(
-                            (half)(((int)(kb->qs[qs_base + 0] >> 4) - 8) * d),
-                            (half)(((int)(kb->qs[qs_base + 1] >> 4) - 8) * d),
-                            (half)(((int)(kb->qs[qs_base + 2] >> 4) - 8) * d),
-                            (half)(((int)(kb->qs[qs_base + 3] >> 4) - 8) * d)
-                        );
-                    }
-                }
+            half4 k_val = (half4)(0.0h);
+            if (row < k_tile_size) {
+                const ulong k_row_offset = k_base_offset + (k_start + row) * k_nb1;
+                const global struct block_q4_0 * k_blocks = 
+                    (const global struct block_q4_0 *)(k_base + k_row_offset);
                 
-                // Dequantize V
-                if (block_idx < v_blocks_per_row) {
-                    const ulong v_row_offset = v_base_offset + (k_start + tile_row) * v_nb1;
-                    const global struct block_q4_0 * v_blocks = 
-                        (const global struct block_q4_0 *)(v_base + v_row_offset);
-                    const global struct block_q4_0 * vb = &v_blocks[block_idx];
-                    const half d = vb->d;
-                    const int out_idx = block_idx * 8 + vec_idx;
-                    
-                    const int elem_base = vec_idx * 4;
-                    if (elem_base < 16) {
-                        l_v[tile_row][out_idx] = (half4)(
-                            (half)(((int)(vb->qs[elem_base + 0] & 0x0F) - 8) * d),
-                            (half)(((int)(vb->qs[elem_base + 1] & 0x0F) - 8) * d),
-                            (half)(((int)(vb->qs[elem_base + 2] & 0x0F) - 8) * d),
-                            (half)(((int)(vb->qs[elem_base + 3] & 0x0F) - 8) * d)
-                        );
-                    } else {
-                        const int qs_base = elem_base - 16;
-                        l_v[tile_row][out_idx] = (half4)(
-                            (half)(((int)(vb->qs[qs_base + 0] >> 4) - 8) * d),
-                            (half)(((int)(vb->qs[qs_base + 1] >> 4) - 8) * d),
-                            (half)(((int)(vb->qs[qs_base + 2] >> 4) - 8) * d),
-                            (half)(((int)(vb->qs[qs_base + 3] >> 4) - 8) * d)
-                        );
-                    }
+                const int block_idx = col / 8;
+                const int vec_idx = col % 8;
+                const global struct block_q4_0 * kb = &k_blocks[block_idx];
+                const half d = kb->d;
+                
+                const int elem_base = vec_idx * 4;
+                if (vec_idx < 4) {
+                    k_val = (half4)(
+                        (half)(((int)(kb->qs[elem_base + 0] & 0x0F) - 8) * d),
+                        (half)(((int)(kb->qs[elem_base + 1] & 0x0F) - 8) * d),
+                        (half)(((int)(kb->qs[elem_base + 2] & 0x0F) - 8) * d),
+                        (half)(((int)(kb->qs[elem_base + 3] & 0x0F) - 8) * d)
+                    );
+                } else {
+                    const int qs_base = elem_base - 16;
+                    k_val = (half4)(
+                        (half)(((int)(kb->qs[qs_base + 0] >> 4) - 8) * d),
+                        (half)(((int)(kb->qs[qs_base + 1] >> 4) - 8) * d),
+                        (half)(((int)(kb->qs[qs_base + 2] >> 4) - 8) * d),
+                        (half)(((int)(kb->qs[qs_base + 3] >> 4) - 8) * d)
+                    );
                 }
             }
+            l_k[row][col] = k_val;
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -295,15 +264,43 @@ __kernel void flash_attn_f32_q4_0(
                     p_sum += p[w];
                 }
 
-                // V accumulation - from local memory (same as FP16!)
+                // V accumulation - direct global memory access
                 #pragma unroll
                 for (int i = 0; i < DV_VEC; ++i) {
                     float4 v_acc = (float4)(0.0f);
                     
                     #pragma unroll
                     for (int w = 0; w < UNROLL_FACTOR; ++w) {
-                        if (j + w < k_tile_size && p[w] > 0.0f) {
-                            v_acc = mad((float4)(p[w]), convert_float4(l_v[j + w][i]), v_acc);
+                        const int k_row = k_start + j + w;
+                        if (k_row < n_kv && p[w] > 0.0f) {
+                            const ulong v_row_offset = v_base_offset + k_row * v_nb1;
+                            const global struct block_q4_0 * v_blocks = 
+                                (const global struct block_q4_0 *)(v_base + v_row_offset);
+                            
+                            const int block_idx = i / 8;
+                            const int vec_idx = i % 8;
+                            const global struct block_q4_0 * vb = &v_blocks[block_idx];
+                            const half d = vb->d;
+                            
+                            half4 v_val;
+                            const int elem_base = vec_idx * 4;
+                            if (vec_idx < 4) {
+                                v_val = (half4)(
+                                    (half)(((int)(vb->qs[elem_base + 0] & 0x0F) - 8) * d),
+                                    (half)(((int)(vb->qs[elem_base + 1] & 0x0F) - 8) * d),
+                                    (half)(((int)(vb->qs[elem_base + 2] & 0x0F) - 8) * d),
+                                    (half)(((int)(vb->qs[elem_base + 3] & 0x0F) - 8) * d)
+                                );
+                            } else {
+                                const int qs_base = elem_base - 16;
+                                v_val = (half4)(
+                                    (half)(((int)(vb->qs[qs_base + 0] >> 4) - 8) * d),
+                                    (half)(((int)(vb->qs[qs_base + 1] >> 4) - 8) * d),
+                                    (half)(((int)(vb->qs[qs_base + 2] >> 4) - 8) * d),
+                                    (half)(((int)(vb->qs[qs_base + 3] >> 4) - 8) * d)
+                                );
+                            }
+                            v_acc = mad((float4)(p[w]), convert_float4(v_val), v_acc);
                         }
                     }
                     
@@ -365,6 +362,198 @@ __kernel void flash_attn_f32_q4_0(
         #pragma unroll
         for (int i = 0; i < DV_VEC; ++i) {
             o_row[i] = (float4)(0.0f);
+        }
+    }
+}
+
+
+// =================================================================================================
+// Optimized Decoding Kernel for Q4_0 (Dimension Parallelism)
+// =================================================================================================
+// Each thread handles 2 output elements
+// K and V read on-the-fly with optimized dequantization
+// Subgroup reduction for score calculation
+// =================================================================================================
+__kernel void flash_attn_f32_q4_0_q1(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset
+) {
+    // Cache Q in local memory
+    __local float l_q[DK];
+    
+    const int tid = get_local_id(0);
+    const int head_batch_idx = get_global_id(1);
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx % n_head;
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    // Load Q cooperatively
+    const global char* q_base = (const global char*)q_void + q_offset;
+    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+    const global float* q_ptr = (const global float*)(q_base + q_row_offset);
+
+    for (int i = tid; i < DK; i += WG_SIZE) {
+        l_q[i] = q_ptr[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Each thread handles 2 output elements
+    float2 my_o_acc = (float2)(0.0f, 0.0f);
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+
+    const int my_dim_base = tid * 2;
+
+    const global char* k_base = (const global char*)k_void + k_offset;
+    const global char* v_base = (const global char*)v_void + v_offset;
+    
+    const global char* mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx = head_idx % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char*)mask_void + mask_offset + 
+                    mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+    
+    // Sink initialization
+    if (sinks_void != NULL) {
+        const global float* sinks_ptr = (const global float*)((const global char*)sinks_void + sinks_offset);
+        m_local = sinks_ptr[head_idx];
+    }
+
+    // Main KV loop - iterate over each KV token
+    for (int k_idx = 0; k_idx < n_kv; ++k_idx) {
+        // Read and dequantize K (2 elements for this thread)
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const global struct block_q4_0 * k_blocks = 
+            (const global struct block_q4_0 *)(k_base + k_row_offset);
+        
+        float my_score_part = 0.0f;
+        if (my_dim_base < DK) {
+            // Dequantize 2 K elements
+            const int block_idx = my_dim_base / QK4_0;
+            const int offset_in_block = my_dim_base % QK4_0;
+            const global struct block_q4_0 * kb = &k_blocks[block_idx];
+            const float d = kb->d;
+            
+            float2 k_val;
+            if (offset_in_block < 16) {
+                k_val = (float2)(
+                    ((int)(kb->qs[offset_in_block] & 0x0F) - 8) * d,
+                    ((int)(kb->qs[offset_in_block + 1] & 0x0F) - 8) * d
+                );
+            } else {
+                const int qs_idx = offset_in_block - 16;
+                k_val = (float2)(
+                    ((int)(kb->qs[qs_idx] >> 4) - 8) * d,
+                    ((int)(kb->qs[qs_idx + 1] >> 4) - 8) * d
+                );
+            }
+            
+            float2 q_val = (float2)(l_q[my_dim_base], l_q[my_dim_base + 1]);
+            my_score_part = dot(q_val, k_val);
+        }
+
+        // Subgroup reduction for score
+        float score = sub_group_reduce_add(my_score_part);
+        
+        // Score scaling & masking
+        score *= scale;
+        if (mask_base != NULL) {
+            const global half* mask_ptr = (const global half*)(mask_base);
+            score += slope * (float)mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+
+        // Online softmax update
+        float m_prev = m_local;
+        m_local = fmax(m_prev, score);
+        
+        float p = 0.0f;
+        float scale_prev = 1.0f;
+        if (m_local > -INFINITY) {
+            p = exp(score - m_local);
+            scale_prev = (m_prev > -INFINITY) ? exp(m_prev - m_local) : 0.0f;
+        }
+
+        l_local = l_local * scale_prev + p;
+
+        // Read and dequantize V (2 elements for this thread)
+        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+        const global struct block_q4_0 * v_blocks = 
+            (const global struct block_q4_0 *)(v_base + v_row_offset);
+        
+        if (my_dim_base < DV) {
+            const int block_idx = my_dim_base / QK4_0;
+            const int offset_in_block = my_dim_base % QK4_0;
+            const global struct block_q4_0 * vb = &v_blocks[block_idx];
+            const float d = vb->d;
+            
+            float2 v_val;
+            if (offset_in_block < 16) {
+                v_val = (float2)(
+                    ((int)(vb->qs[offset_in_block] & 0x0F) - 8) * d,
+                    ((int)(vb->qs[offset_in_block + 1] & 0x0F) - 8) * d
+                );
+            } else {
+                const int qs_idx = offset_in_block - 16;
+                v_val = (float2)(
+                    ((int)(vb->qs[qs_idx] >> 4) - 8) * d,
+                    ((int)(vb->qs[qs_idx + 1] >> 4) - 8) * d
+                );
+            }
+            
+            my_o_acc = mad((float2)(p), v_val, my_o_acc * scale_prev);
+        }
+    }
+
+    // Final normalize & write
+    if (l_local > 0.0f) {
+        float l_inv = 1.0f / l_local;
+        my_o_acc *= l_inv;
+    } else {
+        my_o_acc = (float2)(0.0f);
+    }
+
+    global char* o_base = (global char*)o_void + o_offset;
+    ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    global float* o_ptr = (global float*)(o_base + o_row_offset);
+
+    if (my_dim_base < DV) {
+        o_ptr[my_dim_base] = my_o_acc.x;
+        if (my_dim_base + 1 < DV) {
+            o_ptr[my_dim_base + 1] = my_o_acc.y;
         }
     }
 }
