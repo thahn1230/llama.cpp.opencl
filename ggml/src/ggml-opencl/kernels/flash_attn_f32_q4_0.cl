@@ -17,11 +17,9 @@ struct block_q4_0
 #define ACC_TYPE float
 #define ACC_TYPE4 float4
 #define Q_DATA_TYPE4 float4
-#define KV_DATA_TYPE4 half4
 #define O_DATA_TYPE4 float4
 #define MASK_DATA_TYPE half
 #define CONVERT_Q_ACC4(x) (x)
-#define CONVERT_KV_ACC4(x) convert_float4(x)
 #define CONVERT_O_DATA4(x) (x)
 
 #ifndef DK
@@ -31,28 +29,75 @@ struct block_q4_0
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
-#define DEC_WG_SIZE 64
 
-// Dequantize Q4_0 block to half4 vectors
-inline void dequantize_q4_0_block_to_half4(
+// Q4_0 dequantization - EXACT pattern from cpy.cl
+// Q4_0 format: qs[i] stores value[i] (low nibble) and value[i+16] (high nibble)
+// Cooperative loading for K cache
+inline void dequant_q4_0_block_cooperative(
     global const struct block_q4_0 * block,
     __local half4 * out,
-    int out_offset
+    int tid,
+    int stride
 ) {
-    const float d = block->d;
+    const half d = block->d;
     
-    // Dequantize 32 values from Q4_0 block
-    // Each qs byte contains 2 4-bit values
-    for (int i = 0; i < QK4_0/2; ++i) {
-        const int x0 = (block->qs[i] & 0x0F) - 8;
-        const int x1 = (block->qs[i] >>   4) - 8;
+    // 32 elements = 16 qs bytes = 8 half4 vectors
+    // Process cooperatively across threads
+    for (int vec_idx = tid; vec_idx < 8; vec_idx += stride) {
+        // Which 4 elements are we processing?
+        const int elem_base = vec_idx * 4;
         
-        const half h0 = (half)(x0 * d);
-        const half h1 = (half)(x1 * d);
-        
-        // Store as scalars, will be read as half4 later
-        ((__local half*)(out + out_offset))[i]          = h0;
-        ((__local half*)(out + out_offset))[i+QK4_0/2] = h1;
+        if (elem_base < 16) {
+            // First 4 half4 vectors: elements 0-15 (low nibbles)
+            const int qs_base = elem_base;
+            out[vec_idx] = (half4)(
+                (half)(((int)(block->qs[qs_base + 0] & 0x0F) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 1] & 0x0F) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 2] & 0x0F) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 3] & 0x0F) - 8) * d)
+            );
+        } else {
+            // Last 4 half4 vectors: elements 16-31 (high nibbles)
+            const int qs_base = elem_base - 16;
+            out[vec_idx] = (half4)(
+                (half)(((int)(block->qs[qs_base + 0] >> 4) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 1] >> 4) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 2] >> 4) - 8) * d),
+                (half)(((int)(block->qs[qs_base + 3] >> 4) - 8) * d)
+            );
+        }
+    }
+}
+
+// Fast inline V dequantization - EXACT pattern from cpy.cl
+inline half4 dequant_q4_0_vec4(
+    global const struct block_q4_0 * blocks,
+    int elem_idx
+) {
+    const int block_idx = elem_idx / QK4_0;
+    const int offset_in_block = elem_idx % QK4_0;
+    
+    global const struct block_q4_0 * block = &blocks[block_idx];
+    const half d = block->d;
+    
+    // Each half4 has 4 consecutive elements
+    if (offset_in_block < 16) {
+        // Elements 0-15: low nibbles
+        return (half4)(
+            (half)(((int)(block->qs[offset_in_block + 0] & 0x0F) - 8) * d),
+            (half)(((int)(block->qs[offset_in_block + 1] & 0x0F) - 8) * d),
+            (half)(((int)(block->qs[offset_in_block + 2] & 0x0F) - 8) * d),
+            (half)(((int)(block->qs[offset_in_block + 3] & 0x0F) - 8) * d)
+        );
+    } else {
+        // Elements 16-31: high nibbles
+        const int qs_idx = offset_in_block - 16;
+        return (half4)(
+            (half)(((int)(block->qs[qs_idx + 0] >> 4) - 8) * d),
+            (half)(((int)(block->qs[qs_idx + 1] >> 4) - 8) * d),
+            (half)(((int)(block->qs[qs_idx + 2] >> 4) - 8) * d),
+            (half)(((int)(block->qs[qs_idx + 3] >> 4) - 8) * d)
+        );
     }
 }
 
@@ -68,6 +113,14 @@ inline float get_alibi_slope(
     return pow(base, exph);
 }
 
+// =================================================================================================
+// Optimized Flash Attention for Q4_0 KV Cache
+// =================================================================================================
+// Strategy:
+// 1. K only in local memory (avoid local memory overflow)
+// 2. V on-the-fly with vectorized dequantization
+// 3. Minimize dequantization overhead with SIMD operations
+// =================================================================================================
 __kernel void flash_attn_f32_q4_0(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -163,12 +216,17 @@ __kernel void flash_attn_f32_q4_0(
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
     const int causal_limit = is_causal ? (n_kv - n_q + my_query_row) : n_kv;
 
-    // Local memory for dequantized K (half precision)
+    // Only K in local memory (8KB) - better occupancy for Q4_0
+    // V is dequantized on-the-fly with optimized inline function
     __local half4 l_k[BLOCK_N][DK_VEC];
 
     // Precompute base offsets
     const ulong v_base_offset = (ulong)batch_idx * v_nb3 + (ulong)head_kv_idx * v_nb2;
     const ulong k_base_offset = (ulong)batch_idx * k_nb3 + (ulong)head_kv_idx * k_nb2;
+
+    // K/V are Q4_0: each row has DK/32 blocks
+    const int k_blocks_per_row = DK / QK4_0;
+    const int v_blocks_per_row = DV / QK4_0;
 
     // Main KV loop
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
@@ -176,22 +234,21 @@ __kernel void flash_attn_f32_q4_0(
         const int k_tile_size = k_tile_end - k_start;
         
         // Load and dequantize K tile cooperatively
-        // K is stored as Q4_0 blocks (32 elements per block)
-        const int blocks_per_row = DK / QK4_0;  // e.g., 128/32 = 4 blocks
-        const int total_blocks = BLOCK_N * blocks_per_row;
-        
         #pragma unroll 1
-        for (int block_idx = tid; block_idx < total_blocks; block_idx += WG_SIZE) {
-            const int row = block_idx / blocks_per_row;
-            const int block_in_row = block_idx % blocks_per_row;
-            
+        for (int row = 0; row < BLOCK_N; ++row) {
             if (row < k_tile_size) {
                 const ulong k_row_offset = k_base_offset + (k_start + row) * k_nb1;
                 const global struct block_q4_0 * k_blocks = 
                     (const global struct block_q4_0 *)(k_base + k_row_offset);
                 
-                // Dequantize one Q4_0 block (32 elements) to local memory
-                dequantize_q4_0_block_to_half4(&k_blocks[block_in_row], l_k[row], block_in_row * QK4_0 / 4);
+                for (int block_idx = 0; block_idx < k_blocks_per_row; ++block_idx) {
+                    dequant_q4_0_block_cooperative(
+                        &k_blocks[block_idx],
+                        &l_k[row][block_idx * (QK4_0/4)],
+                        tid,
+                        WG_SIZE
+                    );
+                }
             }
         }
 
@@ -260,7 +317,7 @@ __kernel void flash_attn_f32_q4_0(
                     p_sum += p[w];
                 }
 
-                // V accumulation - dequantize V blocks on-the-fly
+                // V accumulation - on-the-fly dequantization with optimized inline function
                 #pragma unroll
                 for (int i = 0; i < DV_VEC; ++i) {
                     float4 v_acc = (float4)(0.0f);
@@ -270,35 +327,12 @@ __kernel void flash_attn_f32_q4_0(
                         const int k_row = k_start + j + w;
                         if (k_row < n_kv && p[w] > 0.0f) {
                             const ulong v_row_offset = v_base_offset + k_row * v_nb1;
-                            
-                            // V is stored as Q4_0 blocks
-                            const int v_blocks_per_row = DK / QK4_0;  // DV should be used but assuming DV=DK
-                            const int block_idx_for_vec_i = i / (QK4_0 / 4);  // which block contains this vector
-                            const int vec_offset_in_block = i % (QK4_0 / 4);  // offset within block
-                            
                             const global struct block_q4_0 * v_blocks = 
                                 (const global struct block_q4_0 *)(v_base + v_row_offset);
                             
-                            // Dequantize just the needed vector
-                            const global struct block_q4_0 * v_block = &v_blocks[block_idx_for_vec_i];
-                            const float vd = v_block->d;
-                            
-                            // Extract 4 values from the Q4_0 block
-                            const int base_elem = vec_offset_in_block * 4;
-                            float v_vals[4];
-                            for (int elem = 0; elem < 4; ++elem) {
-                                const int elem_idx = base_elem + elem;
-                                int x;
-                                if (elem_idx < QK4_0/2) {
-                                    x = (v_block->qs[elem_idx] & 0x0F) - 8;
-                                } else {
-                                    x = (v_block->qs[elem_idx - QK4_0/2] >> 4) - 8;
-                                }
-                                v_vals[elem] = x * vd;
-                            }
-                            float4 v_val = (float4)(v_vals[0], v_vals[1], v_vals[2], v_vals[3]);
-                            
-                            v_acc = mad((float4)(p[w]), v_val, v_acc);
+                            // Fast inline dequantization
+                            const half4 v_val = dequant_q4_0_vec4(v_blocks, i * 4);
+                            v_acc = mad((float4)(p[w]), convert_float4(v_val), v_acc);
                         }
                     }
                     
@@ -363,4 +397,3 @@ __kernel void flash_attn_f32_q4_0(
         }
     }
 }
-
