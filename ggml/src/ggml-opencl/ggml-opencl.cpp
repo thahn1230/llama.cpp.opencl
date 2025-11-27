@@ -473,13 +473,16 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
+    cl_kernel kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32;
+    cl_kernel kernel_cpy_q4_0_q4_0, kernel_cpy_q4_0_f16, kernel_cpy_q4_0_f32;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
@@ -790,6 +793,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_cpy_f16_f32 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_f16_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_f32_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_q4_0_q4_0 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_q4_0_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_q4_0_f16 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_q4_0_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_q4_0_f32 = clCreateKernel(backend_ctx->program_cpy, "kernel_cpy_q4_0_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1463,10 +1469,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32_f16 {
                     #include "flash_attn_f32_f16.cl.h"
                 };
+                const std::string kernel_src_f32_q4_0 {
+                    #include "flash_attn_f32_q4_0.cl.h"
+                };
         #else
                 const std::string kernel_src_f16 = read_file("flash_attn_f16.cl");
                 const std::string kernel_src_f32 = read_file("flash_attn_f32.cl");
                 const std::string kernel_src_f32_f16 = read_file("flash_attn_f32_f16.cl");
+                const std::string kernel_src_f32_q4_0 = read_file("flash_attn_f32_q4_0.cl");
         #endif
 
         if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty()) {
@@ -1510,6 +1520,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 backend_ctx->kernels_flash_attn_f32_f16[{dk, dv}] = k_f32_f16;
                 backend_ctx->kernels_flash_attn_f32_f16_q1[{dk, dv}] = k_f32_f16_q1;
                 CL_CHECK(clReleaseProgram(prog_f32_f16));
+
+                cl_program prog_f32_q4_0 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q4_0.c_str(), OPTS);
+                cl_kernel k_f32_q4_0;
+                CL_CHECK((k_f32_q4_0 = clCreateKernel(prog_f32_q4_0, "flash_attn_f32_q4_0", &err), err));
+                backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}] = k_f32_q4_0;
+                CL_CHECK(clReleaseProgram(prog_f32_q4_0));
 
                 backend_ctx->kernels_flash_attn_bm[{dk, dv}] = bm;
                 backend_ctx->kernels_flash_attn_bn[{dk, dv}] = bn;
@@ -1845,6 +1861,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -2986,15 +3004,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_SET_ROWS:
             {
-                // TODO: add support
+                // TODO: add support for more quantization types
                 // ref: https://github.com/ggml-org/llama.cpp/pull/14274
-#pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
+#pragma message("TODO: implement BF16, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
                 switch (op->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
+                    case GGML_TYPE_Q4_0:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -3014,6 +3033,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     }
                 case GGML_TYPE_F16:
                     switch (op->type) {
+                        case GGML_TYPE_F16:
+                        case GGML_TYPE_F32:
+                            return true;
+                        default:
+                            return false;
+                    }
+                case GGML_TYPE_Q4_0:
+                    switch (op->type) {
+                        case GGML_TYPE_Q4_0:
                         case GGML_TYPE_F16:
                         case GGML_TYPE_F32:
                             return true;
@@ -3197,8 +3225,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
                 const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+                const bool is_f32_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 &&
+                                         v->type == GGML_TYPE_Q4_0 && op->type == GGML_TYPE_F32;
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16;
+                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f32_q4_0;
             }
         default:
             return false;
@@ -4601,6 +4631,13 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
                 kernel = backend_ctx->kernel_set_rows_f16_i64;
             } else {
                 kernel = backend_ctx->kernel_set_rows_f16_i32;
+            }
+            break;
+        case GGML_TYPE_Q4_0:
+            if (src1->type == GGML_TYPE_I64) {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i64;
+            } else {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i32;
             }
             break;
         default:
@@ -6760,10 +6797,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
+    const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
     if (n_q == 1) {
-        if (is_mixed) {
+        if (is_q4_0) {
+            // Q4_0 KV cache doesn't have decoding kernel yet, use prefill kernel
+            kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+        } else if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
@@ -6771,7 +6812,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             kernel = backend_ctx->kernels_flash_attn_f32_q1.at(dk_dv);
         }
     } else {
-        if (is_mixed) {
+        if (is_q4_0) {
+            kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+        } else if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
@@ -8617,6 +8660,21 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                     break;
                 case GGML_TYPE_F32:
                     kernel = backend_ctx->kernel_cpy_f16_f32;
+                    break;
+                default:
+                    GGML_ASSERT(false && "not implemented");
+            }
+            break;
+        case GGML_TYPE_Q4_0:
+            switch (src1t) {
+                case GGML_TYPE_Q4_0:
+                    kernel = backend_ctx->kernel_cpy_q4_0_q4_0;
+                    break;
+                case GGML_TYPE_F16:
+                    kernel = backend_ctx->kernel_cpy_q4_0_f16;
+                    break;
+                case GGML_TYPE_F32:
+                    kernel = backend_ctx->kernel_cpy_q4_0_f32;
                     break;
                 default:
                     GGML_ASSERT(false && "not implemented");
