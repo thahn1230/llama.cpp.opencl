@@ -25,34 +25,42 @@ inline uint fastmod(uint n, uint4 v) {
 }
 
 //------------------------------------------------------------------------------
-// quantize_q4_0 - Quantize QK4_0 float values to Q4_0 format
+// quantize_q4_0 - Optimized Q4_0 quantization (CUDA-inspired)
+//------------------------------------------------------------------------------
+// Key optimizations:
+// 1. Reduced memory writes by packing in register
+// 2. Better loop unrolling
 //------------------------------------------------------------------------------
 void quantize_q4_0(global const float * src, global struct block_q4_0 * dst) {
-    float amax = 0.0f; // absolute max
-    float max  = 0.0f;
+    float amax = 0.0f;
+    float max = 0.0f;
 
+    // Find max value
+    #pragma unroll 8
     for (int j = 0; j < QK4_0; j++) {
         const float v = src[j];
-        if (amax < fabs(v)) {
-            amax = fabs(v);
-            max  = v;
+        const float abs_v = fabs(v);
+        if (amax < abs_v) {
+            amax = abs_v;
+            max = v;
         }
     }
 
     const float d = max / -8.0f;
-    const float id = (d != 0.0f) ? 1.0f/d : 0.0f;
+    const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
 
-    dst->d = d;
+    dst->d = (half)d;
 
+    // Quantize and pack
+    #pragma unroll 8
     for (int j = 0; j < QK4_0/2; ++j) {
-        const float x0 = src[0       + j]*id;
-        const float x1 = src[QK4_0/2 + j]*id;
+        const float x0 = src[j] * id;
+        const float x1 = src[j + QK4_0/2] * id;
 
-        const uint8_t xi0 = min((uint8_t)15, (uint8_t)((char)(x0 + 8.5f)));
-        const uint8_t xi1 = min((uint8_t)15, (uint8_t)((char)(x1 + 8.5f)));
+        const uint8_t xi0 = min((uint8_t)15, (uint8_t)(x0 + 8.5f));
+        const uint8_t xi1 = min((uint8_t)15, (uint8_t)(x1 + 8.5f));
 
-        dst->qs[j]  = xi0;
-        dst->qs[j] |= xi1 << 4;
+        dst->qs[j] = xi0 | (xi1 << 4);
     }
 }
 

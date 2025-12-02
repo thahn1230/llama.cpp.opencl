@@ -14,17 +14,23 @@ struct block_q4_0
 };
 
 //------------------------------------------------------------------------------
-// dequantize_block_q4_0 - Dequantize one Q4_0 block to float
+// dequantize_block_q4_0 - Optimized Q4_0 dequantization (CUDA-inspired)
+//------------------------------------------------------------------------------
+// Key optimization: (q - 8) * d = q * d + (-8 * d)
+// Uses MAD instruction for better performance
 //------------------------------------------------------------------------------
 void dequantize_block_q4_0(global const struct block_q4_0 * block, float * result) {
     const float d = block->d;
+    const float dm = -8.0f * d;  // Pre-compute -8*d
     
     for (int i = 0; i < QK4_0/2; ++i) {
-        const int x0 = (block->qs[i] & 0x0F) - 8;
-        const int x1 = (block->qs[i] >>   4) - 8;
+        const uint8_t q_byte = block->qs[i];
         
-        result[i]        = x0 * d;
-        result[i+QK4_0/2] = x1 * d;
+        // Low nibble (first half)
+        result[i] = mad((float)(q_byte & 0x0F), d, dm);
+        
+        // High nibble (second half)
+        result[i + QK4_0/2] = mad((float)(q_byte >> 4), d, dm);
     }
 }
 
@@ -299,19 +305,19 @@ kernel void kernel_cpy_q4_0_f16(
 
     global half * dst_data = (global half *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
 
-    // Dequantize Q4_0 blocks to F16
+    // Dequantize Q4_0 blocks to F16 (optimized)
     int nblocks = ne00 / QK4_0;
     for (int iblock = get_local_id(0); iblock < nblocks; iblock += get_local_size(0)) {
         global const struct block_q4_0 * src_block = (global const struct block_q4_0 *)(src0 + i03*nb03 + i02*nb02 + i01*nb01 + iblock*nb00);
         
         const float d = src_block->d;
+        const float dm = -8.0f * d;
         
         for (int i = 0; i < QK4_0/2; ++i) {
-            const int x0 = (src_block->qs[i] & 0x0F) - 8;
-            const int x1 = (src_block->qs[i] >>   4) - 8;
+            const uint8_t q_byte = src_block->qs[i];
             
-            dst_data[iblock*QK4_0 + i]        = (half)(x0 * d);
-            dst_data[iblock*QK4_0 + i+QK4_0/2] = (half)(x1 * d);
+            dst_data[iblock*QK4_0 + i] = (half)mad((float)(q_byte & 0x0F), d, dm);
+            dst_data[iblock*QK4_0 + i + QK4_0/2] = (half)mad((float)(q_byte >> 4), d, dm);
         }
     }
 }
@@ -354,19 +360,19 @@ kernel void kernel_cpy_q4_0_f32(
 
     global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
 
-    // Dequantize Q4_0 blocks to F32
+    // Dequantize Q4_0 blocks to F32 (optimized)
     int nblocks = ne00 / QK4_0;
     for (int iblock = get_local_id(0); iblock < nblocks; iblock += get_local_size(0)) {
         global const struct block_q4_0 * src_block = (global const struct block_q4_0 *)(src0 + i03*nb03 + i02*nb02 + i01*nb01 + iblock*nb00);
         
         const float d = src_block->d;
+        const float dm = -8.0f * d;
         
         for (int i = 0; i < QK4_0/2; ++i) {
-            const int x0 = (src_block->qs[i] & 0x0F) - 8;
-            const int x1 = (src_block->qs[i] >>   4) - 8;
+            const uint8_t q_byte = src_block->qs[i];
             
-            dst_data[iblock*QK4_0 + i]        = x0 * d;
-            dst_data[iblock*QK4_0 + i+QK4_0/2] = x1 * d;
+            dst_data[iblock*QK4_0 + i] = mad((float)(q_byte & 0x0F), d, dm);
+            dst_data[iblock*QK4_0 + i + QK4_0/2] = mad((float)(q_byte >> 4), d, dm);
         }
     }
 }
